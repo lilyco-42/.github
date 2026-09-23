@@ -1,0 +1,119 @@
+name: lyco sync stars
+
+# 生态级「星数自动同步」reusable workflow
+#
+# 背景：docs/banner.svg 的角标和个人主页 README 的卡片行里都写死了 ★N，
+# 星数一变就过期（2026-09-23 一次性发现 5 处过期：lilyco ★5→6、rembg-ui ★5→7、
+# dsh-termux ★10→18、ghboost ★2→3、lyco-skill ★5→9）。
+# 本 workflow 每天比对一次，**只有真的不一致才提交**。
+#
+# 用法（任意生态仓库的 .github/workflows/sync-stars.yml）：
+#   name: sync stars
+#   on:
+#     schedule: [{ cron: "17 3 * * *" }]
+#     workflow_dispatch:
+#   jobs:
+#     sync:
+#       permissions: { contents: write }
+#       uses: lilyco-42/.github/.github/workflows/lyco-sync-stars.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      files:
+        description: "要扫描的文件（逗号分隔，相对仓库根）；不存在或无 ★ 的自动跳过"
+        type: string
+        default: "docs/banner.svg,README.md"
+
+jobs:
+  sync:
+    name: sync ★N
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 规则：
+      #   1) `**[名字](https://github.com/<owner>/<repo>)** ★N` → 取 **那个仓** 的真实星数
+      #   2) 文件里剩下的裸 `★N`（banner 角标）→ 取 **本仓** 的真实星数
+      - name: 比对 ★N
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_FILES: ${{ inputs.files }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          repo_full = os.environ["GITHUB_REPOSITORY"]
+          owner, repo = repo_full.split("/")
+          files = [f.strip() for f in os.environ.get("SYNC_FILES", "").split(",") if f.strip()]
+
+          cache = {}
+          def stars(r):
+              if r not in cache:
+                  p = subprocess.run(["gh", "api", f"repos/{owner}/{r}", "--jq", ".stargazers_count"],
+                                     capture_output=True, text=True)
+                  cache[r] = p.stdout.strip() if p.returncode == 0 else None
+              return cache[r]
+
+          own = stars(repo)
+          if own is None:
+              sys.exit(f"::error::拿不到 {repo_full} 的星数")
+          print(f"本仓 {repo_full} = ★{own}")
+
+          S = "\x00"
+          pat_link = re.compile(
+              r"(\*\*\[[^\]]*\]\(https://github\.com/" + re.escape(owner) + r"/([^)/]+)\)\*\* )★(\d+)")
+
+          notes = []
+          for f in files:
+              if not os.path.exists(f):
+                  print(f"跳过（不存在）: {f}"); continue
+              txt = open(f, encoding="utf-8").read()
+              if "★" not in txt:
+                  print(f"跳过（无 ★）: {f}"); continue
+
+              def link_repl(m):
+                  s = stars(m.group(2))
+                  return m.group(0) if s is None else f"{m.group(1)}★{S}{s}{S}"
+
+              new = pat_link.sub(link_repl, txt)
+              new = re.sub(r"★\d+", f"★{S}{own}{S}", new)
+              new = re.sub("★" + S + r"(\d+)" + S, r"★\1", new)
+
+              if new == txt:
+                  print(f"无变化: {f}"); continue
+
+              old_n, new_n = re.findall(r"★(\d+)", txt), re.findall(r"★(\d+)", new)
+              diff = ", ".join(f"★{a}→★{b}" for a, b in zip(old_n, new_n) if a != b) or "已同步"
+              notes.append(f"{f} {diff}")
+              open(f, "w", encoding="utf-8").write(new)
+              print(f"改动: {f} {diff}")
+
+          msg = "docs(banner): 星数自动同步 —— " + "；".join(notes) if notes \
+                else "chore(sync-stars): 星数已是最新"
+          open("/tmp/sync-msg.txt", "w", encoding="utf-8").write(msg + "\n")
+          print(msg)
+          PY
+
+      - name: 提交（仅在有变化时）
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "✅ 星数已是最新，本次不提交"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "$(cat /tmp/sync-msg.txt)"
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "✅ 已推送"; exit 0
+            fi
+            echo "推送失败，重试 $i/3 …"; sleep 5
+          done
+          echo "::error::推送失败（可能与其他提交冲突），下一个定时任务会自动重试"
+          exit 1
